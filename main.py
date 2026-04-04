@@ -1,12 +1,17 @@
 import asyncio
 import httpx
 from datetime import datetime
+from urllib.parse import quote
 
 # 配置
 PAT_TOKEN = "patcwx5vX4lDXmmcK.d71c96b0e23cd0763569b78e091b74d195d41832c29f79dc72a82e65e7b74a49"
 MASTER_BASE_ID = "appITVvwl1rimUNWX" 
 TARGET_TABLE_NAME = "Base 资产清单"
 HEADERS = {"Authorization": f"Bearer {PAT_TOKEN}", "Content-Type": "application/json"}
+
+# 【核心改进】对中文表名进行 URL 编码
+TABLE_NAME_ENCODED = quote(TARGET_TABLE_NAME)
+MASTER_URL = f"https://api.airtable.com/v0/{MASTER_BASE_ID}/{TABLE_NAME_ENCODED}"
 
 async def get_real_count(client, base_id, table_id):
     count, offset = 0, None
@@ -22,7 +27,9 @@ async def get_real_count(client, base_id, table_id):
 
 async def main():
     async with httpx.AsyncClient(timeout=300.0) as client:
-        # 1. 获取全量最新的 Table ID
+        print(f"🚀 开始同步到表: {TARGET_TABLE_NAME}...")
+        
+        # 1. 获取全量 Table 列表
         base_res = await client.get("https://api.airtable.com/v0/meta/bases", headers=HEADERS)
         all_bases = base_res.json().get("bases", [])
         current_tables = []
@@ -34,26 +41,18 @@ async def main():
         
         active_ids = [item["t_id"] for item in current_tables]
 
-        # 2. 获取清单现有记录
+        # 2. 获取资产清单现有记录 (使用编码后的 URL)
         m_records = []
         m_offset = None
-        m_url = f"https://api.airtable.com/v0/{MASTER_BASE_ID}/{TARGET_TABLE_NAME}"
         while True:
-            r = await client.get(m_url, headers=HEADERS, params={"offset": m_offset} if m_offset else {})
+            r = await client.get(MASTER_URL, headers=HEADERS, params={"offset": m_offset} if m_offset else {})
+            if r.status_code != 200: break
             data = r.json()
             m_records.extend(data.get("records", []))
             m_offset = data.get("offset")
             if not m_offset: break
 
-        # 3. 【先清理】V3.0 功能：删除已不在的表
-        print("🧹 正在清理已删除的表...")
-        for r in m_records:
-            if r["fields"].get("Table ID") not in active_ids:
-                await client.delete(f"{m_url}/{r['id']}", headers=HEADERS)
-                await asyncio.sleep(0.3)
-
-        # 4. 【后更新】逐个同步（完全对齐 JS 版逻辑）
-        print(f"🚀 开始同步 {len(current_tables)} 个表...")
+        # 3. 逐个更新/新增
         for item in current_tables:
             cnt = await get_real_count(client, item["b_id"], item["t_id"])
             match = next((r for r in m_records if r["fields"].get("Table ID") == item["t_id"]), None)
@@ -67,12 +66,22 @@ async def main():
             }}
             
             if match:
-                await client.patch(f"{m_url}/{match['id']}", headers=HEADERS, json=payload)
+                res = await client.patch(f"{MASTER_URL}/{match['id']}", headers=HEADERS, json=payload)
             else:
-                await client.post(m_url, headers=HEADERS, json=payload)
+                res = await client.post(MASTER_URL, headers=HEADERS, json=payload)
             
-            print(f"✅ 同步完成: {item['t_name']} = {cnt}")
-            await asyncio.sleep(0.5) # 强行等待，确保 Airtable 收到并写入
+            if res.status_code not in [200, 201]:
+                print(f"❌ 写入失败 [{item['t_name']}]: {res.text}")
+            else:
+                print(f"✅ 同步成功: {item['t_name']} = {cnt}")
+            
+            await asyncio.sleep(0.3)
+
+        # 4. 清理逻辑 (V3.0)
+        for r in m_records:
+            if r["fields"].get("Table ID") not in active_ids:
+                await client.delete(f"{MASTER_URL}/{r['id']}", headers=HEADERS)
+                await asyncio.sleep(0.3)
 
         print("✨ 任务彻底完成！")
 
