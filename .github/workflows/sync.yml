@@ -1,0 +1,14 @@
+name: Airtable_Sync
+on:
+  schedule:
+    - cron: '0 21 * * *' # 每天北京时间凌晨 5:00 自动运行
+  workflow_dispatch: # 允许你点击按钮手动运行
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run Inspector
+        run: |
+          pip install httpx
+          python main.py
