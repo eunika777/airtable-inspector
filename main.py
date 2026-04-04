@@ -8,98 +8,75 @@ MASTER_BASE_ID = "appITVvwl1rimUNWX"
 TARGET_TABLE_NAME = "Base 资产清单"
 HEADERS = {"Authorization": f"Bearer {PAT_TOKEN}"}
 
-# 严格复刻 ChatGPT 的分页计数逻辑
 async def get_real_count(client, base_id, table_id):
-    count = 0
-    offset = None
-    page = 0
+    count, offset = 0, None
     while True:
-        # 仅请求 ID 字段以提升速度，pageSize=100
-        url = f"https://api.airtable.com/v0/{base_id}/{table_id}?pageSize=100"
-        if offset: url += f"&offset={offset}"
-        
-        resp = await client.get(url, headers=HEADERS)
-        if resp.status_code != 200:
-            print(f"   ❌ 获取失败: {table_id}")
-            break
-            
+        url = f"https://api.airtable.com/v0/{base_id}/{table_id}?pageSize=100&fields[]="
+        params = {"offset": offset} if offset else {}
+        resp = await client.get(url, headers=HEADERS, params=params)
+        if resp.status_code != 200: break
         data = resp.json()
-        records = data.get("records", [])
-        batch = len(records)
-        count += batch
-        
+        count += len(data.get("records", []))
         offset = data.get("offset")
-        page += 1
-        # 如果需要调试，可以取消下面这行的注释查看日志
-        # print(f"      第{page}页 +{batch}（累计{count}）")
-        
-        if not offset:
-            break
+        if not offset: break
     return count
 
 async def main():
-    # 增加超时限制，防止大表卡死
     async with httpx.AsyncClient(timeout=300.0) as client:
-        print("🚀 开始全量真实计数 (复刻 ChatGPT 逻辑)...")
+        print("🚀 开始全量同步...")
         
-        # 1. 获取所有 Base
+        # 1. 获取所有最新的 Table ID
         base_res = await client.get("https://api.airtable.com/v0/meta/bases", headers=HEADERS)
         all_bases = base_res.json().get("bases", [])
-        
-        current_table_ids = []
-        sync_list = []
-
-        # 2. 扫描所有 Table 并记录 ID
+        current_tables = []
         for b in all_bases:
             t_res = await client.get(f"https://api.airtable.com/v0/meta/bases/{b['id']}/tables", headers=HEADERS)
-            if t_res.status_code != 200: continue
             for t in t_res.json().get("tables", []):
-                current_table_ids.append(t['id'])
-                sync_list.append({"b_id": b["id"], "b_name": b["name"], "t_id": t["id"], "t_name": t["name"]})
+                current_tables.append({"b_id": b["id"], "b_name": b["name"], "t_id": t["id"], "t_name": t["name"]})
+        
+        active_ids = [item["t_id"] for item in current_tables]
 
-        # 3. 获取目标清单现有记录 (用于增量更新和删除)
-        m_url = f"https://api.airtable.com/v0/{MASTER_BASE_ID}/{TARGET_TABLE_NAME}"
+        # 2. 获取资产清单现有记录
         m_records = []
         m_offset = None
+        m_url = f"https://api.airtable.com/v0/{MASTER_BASE_ID}/{TARGET_TABLE_NAME}"
         while True:
             r = await client.get(m_url, headers=HEADERS, params={"offset": m_offset} if m_offset else {})
-            d = r.json()
-            m_records.extend(d.get("records", []))
-            m_offset = d.get("offset")
+            data = r.json()
+            m_records.extend(data.get("records", []))
+            m_offset = data.get("offset")
             if not m_offset: break
 
-        # 4. 执行同步 (计数 + 写入)
-        print(f"📊 准备同步 {len(sync_list)} 个表...")
-        for item in sync_list:
+        # 3. 逐个更新/新增 (加入延迟避开频率限制)
+        for item in current_tables:
             cnt = await get_real_count(client, item["b_id"], item["t_id"])
-            
-            # 查找是否存在
             match = next((r for r in m_records if r["fields"].get("Table ID") == item["t_id"]), None)
             
-            payload = {
-                "fields": {
-                    "Base Name": item["b_name"],
-                    "Table Name": item["t_name"],
-                    "Table ID": item["t_id"],
-                    "Table URL": f"https://airtable.com/{item['b_id']}/{item['t_id']}",
-                    "Record Count": cnt,
-                    "Last Updated": datetime.now().strftime("%Y-%m-%d %H:%M")
-                }
-            }
+            payload = {"fields": {
+                "Base Name": item["b_name"],
+                "Table Name": item["t_name"],
+                "Table ID": item["t_id"],
+                "Record Count": cnt,
+                "Last Updated": datetime.now().strftime("%Y-%m-%d %H:%M")
+            }}
             
             if match:
                 await client.patch(f"{m_url}/{match['id']}", headers=HEADERS, json=payload)
             else:
                 await client.post(m_url, headers=HEADERS, json=payload)
-            print(f"   ✅ 完成: {item['t_name']} = {cnt}")
+            
+            print(f"✅ 同步完成: {item['t_name']} = {cnt}")
+            await asyncio.sleep(0.2) # 关键：每秒最多发 5 次请求，防止写入失败
 
-        # 5. 物理清理 (V3.0：自动删除已不存在的表记录)
-        print("🧹 开始清理已删除的表记录...")
+        # 4. 清理逻辑 (V3.0)
+        print("🧹 正在清理已删除的表记录...")
         for r in m_records:
-            if r["fields"].get("Table ID") not in current_table_ids:
+            if r["fields"].get("Table ID") not in active_ids:
                 await client.delete(f"{m_url}/{r['id']}", headers=HEADERS)
-        
-        print("✨ 全部完成（真实行数）")
+                print(f"🗑️ 已删除废弃记录: {r['fields'].get('Table Name')}")
+                await asyncio.sleep(0.2)
+
+        print("✨ 任务彻底完成！")
 
 if __name__ == "__main__":
     asyncio.run(main())
