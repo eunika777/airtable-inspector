@@ -1,17 +1,16 @@
 import asyncio
 import httpx
 from datetime import datetime
-from urllib.parse import quote
 
-# 配置
+# 配置 (请保持不变)
 PAT_TOKEN = "patcwx5vX4lDXmmcK.d71c96b0e23cd0763569b78e091b74d195d41832c29f79dc72a82e65e7b74a49"
 MASTER_BASE_ID = "appITVvwl1rimUNWX" 
-TARGET_TABLE_NAME = "Base 资产清单"
+# 【核心修改】这里直接用 Table ID，不要用中文名，最稳！
+TARGET_TABLE_ID = "tblM9WqW1vTzT0O6m" 
 HEADERS = {"Authorization": f"Bearer {PAT_TOKEN}", "Content-Type": "application/json"}
 
-# 【核心改进】对中文表名进行 URL 编码
-TABLE_NAME_ENCODED = quote(TARGET_TABLE_NAME)
-MASTER_URL = f"https://api.airtable.com/v0/{MASTER_BASE_ID}/{TABLE_NAME_ENCODED}"
+# 资产清单表的 API 地址
+MASTER_URL = f"https://api.airtable.com/v0/{MASTER_BASE_ID}/{TARGET_TABLE_ID}"
 
 async def get_real_count(client, base_id, table_id):
     count, offset = 0, None
@@ -27,9 +26,9 @@ async def get_real_count(client, base_id, table_id):
 
 async def main():
     async with httpx.AsyncClient(timeout=300.0) as client:
-        print(f"🚀 开始同步到表: {TARGET_TABLE_NAME}...")
+        print("🚀 启动全量资产同步 (ID 定位版)...")
         
-        # 1. 获取全量 Table 列表
+        # 1. 扫描所有最新 Table
         base_res = await client.get("https://api.airtable.com/v0/meta/bases", headers=HEADERS)
         all_bases = base_res.json().get("bases", [])
         current_tables = []
@@ -41,12 +40,14 @@ async def main():
         
         active_ids = [item["t_id"] for item in current_tables]
 
-        # 2. 获取资产清单现有记录 (使用编码后的 URL)
+        # 2. 获取清单现有记录
         m_records = []
         m_offset = None
         while True:
             r = await client.get(MASTER_URL, headers=HEADERS, params={"offset": m_offset} if m_offset else {})
-            if r.status_code != 200: break
+            if r.status_code != 200: 
+                print(f"❌ 访问清单表失败，请检查 Table ID: {TARGET_TABLE_ID}")
+                return
             data = r.json()
             m_records.extend(data.get("records", []))
             m_offset = data.get("offset")
@@ -70,14 +71,13 @@ async def main():
             else:
                 res = await client.post(MASTER_URL, headers=HEADERS, json=payload)
             
-            if res.status_code not in [200, 201]:
-                print(f"❌ 写入失败 [{item['t_name']}]: {res.text}")
-            else:
+            if res.status_code in [200, 201]:
                 print(f"✅ 同步成功: {item['t_name']} = {cnt}")
-            
+            else:
+                print(f"❌ 写入失败 [{item['t_name']}]: {res.text}")
             await asyncio.sleep(0.3)
 
-        # 4. 清理逻辑 (V3.0)
+        # 4. 清理 (V3.0)
         for r in m_records:
             if r["fields"].get("Table ID") not in active_ids:
                 await client.delete(f"{MASTER_URL}/{r['id']}", headers=HEADERS)
