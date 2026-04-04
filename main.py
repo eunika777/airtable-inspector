@@ -2,86 +2,67 @@ import asyncio
 import httpx
 from datetime import datetime
 
-# 配置
+# 配置（保持你运行了几个月都没问题的原始数据）
 PAT_TOKEN = "patcwx5vX4lDXmmcK.d71c96b0e23cd0763569b78e091b74d195d41832c29f79dc72a82e65e7b74a49"
 MASTER_BASE_ID = "appITVvwl1rimUNWX" 
 TARGET_TABLE_NAME = "Base 资产清单"
 HEADERS = {"Authorization": f"Bearer {PAT_TOKEN}", "Content-Type": "application/json"}
 
-async def get_real_count(client, base_id, table_id):
-    count, offset = 0, None
-    while True:
-        url = f"https://api.airtable.com/v0/{base_id}/{table_id}?pageSize=100"
-        params = {"offset": offset} if offset else {}
-        resp = await client.get(url, headers=HEADERS, params=params)
-        if resp.status_code != 200: break
-        data = resp.json()
-        count += len(data.get("records", []))
-        offset = data.get("offset")
-        if not offset: break
-    return count
-
 async def main():
     async with httpx.AsyncClient(timeout=300.0) as client:
-        print("🚀 开始同步...")
+        print("🚀 开始全量同步 (原生逻辑复刻)...")
         
-        # 1. 获取最新 Table 列表
-        base_res = await client.get("https://api.airtable.com/v0/meta/bases", headers=HEADERS)
+        # 1. 获取所有 Base
+        base_url = "https://api.airtable.com/v0/meta/bases"
+        base_res = await client.get(base_url, headers=HEADERS)
         all_bases = base_res.json().get("bases", [])
-        current_tables = []
+
+        # 2. 先获取“资产清单”表的现有记录（用于比对 ID）
+        master_url = f"https://api.airtable.com/v0/{MASTER_BASE_ID}/{TARGET_TABLE_NAME}"
+        m_res = await client.get(master_url, headers=HEADERS)
+        m_records = m_res.json().get("records", [])
+
+        # 3. 遍历所有 Base 下的所有 Table
         for b in all_bases:
-            t_res = await client.get(f"https://api.airtable.com/v0/meta/bases/{b['id']}/tables", headers=HEADERS)
-            if t_res.status_code == 200:
-                for t in t_res.json().get("tables", []):
-                    current_tables.append({"b_id": b["id"], "b_name": b["name"], "t_id": t["id"], "t_name": t["name"]})
-        
-        active_ids = [item["t_id"] for item in current_tables]
-
-        # 2. 获取清单现有记录
-        m_records = []
-        m_offset = None
-        m_url = f"https://api.airtable.com/v0/{MASTER_BASE_ID}/{TARGET_TABLE_NAME}"
-        while True:
-            r = await client.get(m_url, headers=HEADERS, params={"offset": m_offset} if m_offset else {})
-            data = r.json()
-            m_records.extend(data.get("records", []))
-            m_offset = data.get("offset")
-            if not m_offset: break
-
-        # 3. 逐个更新/新增
-        for item in current_tables:
-            cnt = await get_real_count(client, item["b_id"], item["t_id"])
-            match = next((r for r in m_records if r["fields"].get("Table ID") == item["t_id"]), None)
+            tables_url = f"https://api.airtable.com/v0/meta/bases/{b['id']}/tables"
+            t_res = await client.get(tables_url, headers=HEADERS)
+            if t_res.status_code != 200: continue
             
-            # 严格对齐字段名
-            fields = {
-                "Base Name": item["b_name"],
-                "Table Name": item["t_name"],
-                "Table ID": item["t_id"],
-                "Record Count": cnt,
-                "Last Updated": datetime.now().strftime("%Y-%m-%d %H:%M")
-            }
-            
-            if match:
-                res = await client.patch(f"{m_url}/{match['id']}", headers=HEADERS, json={"fields": fields})
-            else:
-                res = await client.post(m_url, headers=HEADERS, json={"fields": fields})
-            
-            if res.status_code not in [200, 201]:
-                print(f"❌ 写入失败 [{item['t_name']}]: {res.text}")
-            else:
-                print(f"✅ 同步成功: {item['t_name']} = {cnt}")
-            await asyncio.sleep(0.25)
+            for t in t_res.json().get("tables", []):
+                # 精准计数逻辑
+                count = 0
+                offset = None
+                table_data_url = f"https://api.airtable.com/v0/{b['id']}/{t['id']}"
+                
+                while True:
+                    params = {"pageSize": 100, "fields[]": []}
+                    if offset: params["offset"] = offset
+                    r = await client.get(table_data_url, headers=HEADERS, params=params)
+                    if r.status_code != 200: break
+                    data = r.json()
+                    count += len(data.get("records", []))
+                    offset = data.get("offset")
+                    if not offset: break
+                
+                # 匹配并写入
+                match = next((r for r in m_records if r["fields"].get("Table ID") == t["id"]), None)
+                payload = {
+                    "fields": {
+                        "Base Name": b["name"],
+                        "Table Name": t["name"],
+                        "Table ID": t["id"],
+                        "Record Count": count,
+                        "Last Updated": datetime.now().strftime("%Y-%m-%d %H:%M")
+                    }
+                }
 
-        # 4. 清理 (V3.0)
-        for r in m_records:
-            tid = r["fields"].get("Table ID")
-            if tid and tid not in active_ids:
-                del_res = await client.delete(f"{m_url}/{r['id']}", headers=HEADERS)
-                print(f"🗑️ 清理记录: {r['fields'].get('Table Name')} - {del_res.status_code}")
-                await asyncio.sleep(0.25)
-
-        print("✨ 彻底完成！")
+                if match:
+                    await client.patch(f"{master_url}/{match['id']}", headers=HEADERS, json=payload)
+                else:
+                    await client.post(master_url, headers=HEADERS, json=payload)
+                
+                print(f"✅ {t['name']} = {count}")
+                await asyncio.sleep(0.2) # 严格遵守频率限制
 
 if __name__ == "__main__":
     asyncio.run(main())
