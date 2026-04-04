@@ -2,74 +2,79 @@ import asyncio
 import httpx
 from datetime import datetime
 
-# 配置：完全保持你的原始信息
+# 配置
 PAT_TOKEN = "patcwx5vX4lDXmmcK.d71c96b0e23cd0763569b78e091b74d195d41832c29f79dc72a82e65e7b74a49"
 MASTER_BASE_ID = "appITVvwl1rimUNWX" 
 TARGET_TABLE_NAME = "Base 资产清单"
 HEADERS = {"Authorization": f"Bearer {PAT_TOKEN}", "Content-Type": "application/json"}
 
+async def get_real_count(client, base_id, table_id):
+    count, offset = 0, None
+    while True:
+        url = f"https://api.airtable.com/v0/{base_id}/{table_id}?pageSize=100&fields[]="
+        r = await client.get(url, headers=HEADERS, params={"offset": offset} if offset else {})
+        if r.status_code != 200: break
+        data = r.json()
+        count += len(data.get("records", []))
+        offset = data.get("offset")
+        if not offset: break
+    return count
+
 async def main():
     async with httpx.AsyncClient(timeout=300.0) as client:
-        # 1. 获取所有 Base (逻辑同 JS)
+        # 1. 获取全量最新的 Table ID
         base_res = await client.get("https://api.airtable.com/v0/meta/bases", headers=HEADERS)
-        base_data = base_res.json().get("bases", [])
+        all_bases = base_res.json().get("bases", [])
+        current_tables = []
+        for b in all_bases:
+            t_res = await client.get(f"https://api.airtable.com/v0/meta/bases/{b['id']}/tables", headers=HEADERS)
+            if t_res.status_code == 200:
+                for t in t_res.json().get("tables", []):
+                    current_tables.append({"b_id": b["id"], "b_name": b["name"], "t_id": t["id"], "t_name": t["name"]})
+        
+        active_ids = [item["t_id"] for item in current_tables]
 
-        # 2. 获取目标表现有记录 (JS 版的 selectRecordsAsync)
-        master_url = f"https://api.airtable.com/v0/{MASTER_BASE_ID}/{TARGET_TABLE_NAME}"
-        m_res = await client.get(master_url, headers=HEADERS)
-        m_records = m_res.json().get("records", [])
+        # 2. 获取清单现有记录
+        m_records = []
+        m_offset = None
+        m_url = f"https://api.airtable.com/v0/{MASTER_BASE_ID}/{TARGET_TABLE_NAME}"
+        while True:
+            r = await client.get(m_url, headers=HEADERS, params={"offset": m_offset} if m_offset else {})
+            data = r.json()
+            m_records.extend(data.get("records", []))
+            m_offset = data.get("offset")
+            if not m_offset: break
 
-        # 记录当前所有存在的 Table ID，用于最后的 V3.0 清理逻辑
-        active_table_ids = []
-
-        for b_info in base_data:
-            # 3. 获取每个 Base 下的 Tables
-            t_res = await client.get(f"https://api.airtable.com/v0/meta/bases/{b_info['id']}/tables", headers=HEADERS)
-            if not t_res.is_success: continue
-            tables = t_res.json().get("tables", [])
-
-            for t_info in tables:
-                active_table_ids.append(t_info['id'])
-                
-                # 4. 分页统计行数 (复刻 JS 版的 do...while 逻辑)
-                count = 0
-                offset = None
-                while True:
-                    url = f"https://api.airtable.com/v0/{b_info['id']}/{t_info['id']}?pageSize=100&fields[]="
-                    params = {"offset": offset} if offset else {}
-                    r = await client.get(url, headers=HEADERS, params=params)
-                    if not r.is_success: break
-                    data = r.json()
-                    count += len(data.get("records", []))
-                    offset = data.get("offset")
-                    if not offset: break
-
-                # 5. 查找是否存在并更新 (复刻 JS 的 find 逻辑)
-                match = next((r for r in m_records if r["fields"].get("Table ID") == t_info["id"]), None)
-                
-                payload = {
-                    "fields": {
-                        "Base Name": b_info["name"],
-                        "Table Name": t_info["name"],
-                        "Table ID": t_info["id"],
-                        "Table URL": f"https://airtable.com/{b_info['id']}/{t_info['id']}",
-                        "Record Count": count,
-                        "Last Updated": datetime.now().strftime("%Y-%m-%d %H:%M")
-                    }
-                }
-
-                if match:
-                    await client.patch(f"{master_url}/{match['id']}", headers=HEADERS, json=payload)
-                else:
-                    await client.post(master_url, headers=HEADERS, json=payload)
-                
-                print(f"✅ 完成: {t_info['name']} = {count}")
-                await asyncio.sleep(0.2) # 避开频率限制
-
-        # 6. V3.0 独有功能：清理已在 Airtable 中删除的表记录
+        # 3. 【先清理】V3.0 功能：删除已不在的表
+        print("🧹 正在清理已删除的表...")
         for r in m_records:
-            if r["fields"].get("Table ID") not in active_table_ids:
-                await client.delete(f"{master_url}/{r['id']}", headers=HEADERS)
+            if r["fields"].get("Table ID") not in active_ids:
+                await client.delete(f"{m_url}/{r['id']}", headers=HEADERS)
+                await asyncio.sleep(0.3)
+
+        # 4. 【后更新】逐个同步（完全对齐 JS 版逻辑）
+        print(f"🚀 开始同步 {len(current_tables)} 个表...")
+        for item in current_tables:
+            cnt = await get_real_count(client, item["b_id"], item["t_id"])
+            match = next((r for r in m_records if r["fields"].get("Table ID") == item["t_id"]), None)
+            
+            payload = {"fields": {
+                "Base Name": item["b_name"],
+                "Table Name": item["t_name"],
+                "Table ID": item["t_id"],
+                "Record Count": cnt,
+                "Last Updated": datetime.now().strftime("%Y-%m-%d %H:%M")
+            }}
+            
+            if match:
+                await client.patch(f"{m_url}/{match['id']}", headers=HEADERS, json=payload)
+            else:
+                await client.post(m_url, headers=HEADERS, json=payload)
+            
+            print(f"✅ 同步完成: {item['t_name']} = {cnt}")
+            await asyncio.sleep(0.5) # 强行等待，确保 Airtable 收到并写入
+
+        print("✨ 任务彻底完成！")
 
 if __name__ == "__main__":
     asyncio.run(main())
