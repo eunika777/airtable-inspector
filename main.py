@@ -1,13 +1,13 @@
 """
 ============================================================
 项目名称：Airtable 全 Base 资产清单自动同步系统
-当前版本：V3.1 (稳定版)
-更新日期：2026-04-04
+当前版本：V3.2 (修复版)
+更新日期：2026-04-05
 主要功能：
 1. 【全量同步】扫描账户内所有 Base，精准获取每个表的最新 Record Count。
-2. 【唯一匹配】基于 Table ID 匹配逻辑，确保 242 行记录唯一，不产生重复。
-3. 【数据保护】仅更新行数和时间戳，绝不触碰用户手动填写的“分类”和“常用”列。
-4. 【自动维护】配合 GitHub Actions 每日凌晨自动运行，保持数据准时更新。
+2. 【唯一匹配】基于 Table ID 匹配逻辑，确保记录唯一，不产生重复。
+3. 【URL 补全】自动生成并写入 Table URL，支持一键直达。
+4. 【数据保护】仅更新行数、URL 和时间戳，不触碰手动填写的“分类”和“常用”列。
 ============================================================
 """
 
@@ -48,7 +48,7 @@ async def get_real_count(client, base_id, table_id):
 
 async def main():
     async with httpx.AsyncClient(timeout=300.0) as client:
-        print(f"🚀 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 启动 V3.1 同步任务...")
+        print(f"🚀 [{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 启动 V3.2 同步任务...")
 
         # 1. 获取清单表中现有的所有记录 (建立索引)
         m_records = []
@@ -82,6 +82,9 @@ async def main():
                 # 获取真实行数
                 cnt = await get_real_count(client, b["id"], t["id"])
                 
+                # 生成跳转 URL
+                table_url = f"https://airtable.com/{b['id']}/{t['id']}"
+                
                 # 【核心逻辑】根据 Table ID 匹配现有行
                 match = next((r for r in m_records if r["fields"].get("Table ID") == t["id"]), None)
                 
@@ -89,12 +92,13 @@ async def main():
                     "Base Name": b["name"],
                     "Table Name": t["name"],
                     "Table ID": t["id"],
+                    "Table URL": table_url, # 👈 修复：写入跳转链接
                     "Record Count": cnt,
                     "Last Updated": datetime.now().strftime("%Y-%m-%d %H:%M")
                 }}
 
                 if match:
-                    # 匹配成功：执行 PATCH 更新
+                    # 匹配成功：执行 PATCH 更新 (会补全缺失的 URL)
                     await client.patch(f"{MASTER_URL}/{match['id']}", headers=HEADERS, json=payload)
                     print(f"   ✅ 更新: {t['name']} -> {cnt}")
                 else:
