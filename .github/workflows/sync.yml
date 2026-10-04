@@ -2,13 +2,26 @@ name: Airtable_Sync
 on:
   schedule:
     - cron: '0 21 * * *' # 每天北京时间凌晨 5:00 自动运行
-  workflow_dispatch: # 允许你点击按钮手动运行
+  workflow_dispatch: # 允许手动运行
 jobs:
   run:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # keepalive 提交需要写权限
     steps:
       - uses: actions/checkout@v3
       - name: Run Inspector
+        env:
+          AIRTABLE_PAT: ${{ secrets.AIRTABLE_PAT }}
         run: |
           pip install httpx
           python main.py
+      - name: Keepalive commit
+        # 每次运行都提交 sync.log，产生仓库活动，
+        # 防止 GitHub 因 60 天无活动自动禁用 scheduled workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add sync.log
+          git diff --cached --quiet && echo "no changes to commit" || git commit -m "chore: airtable sync log $(date -u '+%F %T')"
+          git push
